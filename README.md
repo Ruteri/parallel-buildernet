@@ -1,42 +1,90 @@
 # Distributed Block Builder
 
-This is a complete, compilable implementation of the distributed block building protocol described in the design document. The implementation demonstrates parallel block construction using a two-tier gossip network with geographic awareness and role specialization.
+This is a complete, compilable implementation of the distributed block building protocol that enables BuilderNet to scale to thousands of nodes while maintaining low latency and high performance.
+
+## Architecture Overview
+
+The implementation follows a **heterogeneous two-tier architecture** designed to solve the quadratic scaling problems of all-to-all orderflow sharing:
+
+### Key Design Principles
+
+1. **Role Separation**: Nodes are divided into two distinct roles:
+   - **Simulation Nodes (~90%)**: Handle transaction simulation and partial block construction
+   - **Merging Nodes (~10%)**: Merge partial blocks and submit to relays
+
+2. **No Orderflow Gossip**: Unlike traditional gossip networks, **orderflow is NOT gossiped between simulation nodes**. Instead:
+   - Simulation nodes send partial blocks directly to merging nodes
+   - Gossip is used ONLY for network topology discovery and bundle replacements
+
+3. **Geographic Awareness**: 
+   - Minimizes cross-region communication
+   - Ensures at most one hop from transaction receipt to relay submission
+   - Simulation nodes prefer same-region mergers
+
+4. **Deduplication**:
+   - Each transaction is simulated as few times as possible without negatively impacting performance
+   - Only merging nodes save redistribution archive data
+   - Only merging nodes submit blocks to relays
 
 ## Key Features Implemented
 
-### 1. **Two-Tier Architecture**
-- **Simulation Nodes (80%)**: Handle transaction simulation and partial block construction
-- **Merging Nodes (20%)**: Merge partial blocks and handle latency-sensitive orderflow
+### 1. **Partial Block Construction**
+- Simulation nodes build conflict-free sets of transactions
+- Include pre-computed simulation results
 
 ### 2. **Conflict Detection**
 - Tracks touched accounts, storage slots, and consumed nonces
-- Enables safe parallel processing without re-simulation
-- Cherry-picking of non-conflicting transactions from multiple partial blocks
+- Enables parallel processing without conflicts
+- Cherry-picking of non-conflicting transactions
 
-### 3. **Geographic-Aware Gossip**
-- Prefers same-region peers to reduce cross-region traffic
-- Implements selective gossip with configurable fanout
-- Priority propagation for cancellations
+### 3. **Direct Routing**
+- Simulation nodes send partial blocks directly to mergers
+- Latency-sensitive orderflow goes straight to mergers
+- No peer-to-peer orderflow sharing between simulation nodes
 
-### 4. **Orderflow Types**
-- Regular orderflow: Distributed via gossip network
-- Latency-sensitive: Sent directly to merging nodes
+### 4. **Network Topology**
+- Self-organizing based on relay latencies
+- Geographic clustering to minimize latency
+- Dynamic role assignment through consensus
 
-### 5. **Partial Block Construction**
-- Simulation nodes build partial blocks every 100ms
-- Include pre-computed simulation results
-- Merging nodes combine partial blocks intelligently
+## Implementation Details
 
-## Project Structure
+### Transaction Flow
 
-```
-distributed-block-builder/
-├── Cargo.toml              # Project dependencies
-├── src/
-│   └── main.rs            # Main implementation
-└── tests/
-    └── integration_test.rs # Comprehensive tests
-```
+1. **Regular Transactions**:
+   - Submitted to any simulation node
+   - Simulated once and included in partial block
+   - Partial block sent directly to nearby mergers
+   - NO gossiping to other simulation nodes
+
+2. **Latency-Sensitive Transactions**:
+   - Submitted directly to merging nodes
+   - Processed with priority in final block assembly
+   - Saves one network hop for critical orderflow
+
+3. **Replacements**:
+   - Can be submitted to any node
+   - Gossiped through network for quick propagation
+   - Mergers coordinate to ensure consistency
+
+### Role Assignment
+
+Nodes self-organize based on:
+- Relay latencies (nodes with <10ms latency become mergers)
+- Geographic distribution (ensures mergers in each region)
+- Network capacity (maintains ~10% merger ratio)
+
+### Data Management
+
+- **Simulation Nodes**: 
+  - Store transaction data
+  - Do NOT store built block data
+  - Send partial blocks as conflict-free sets
+
+- **Merging Nodes**:
+  - Store redistribution archive data
+  - Save only winning block data (future optimization)
+  - Coordinate with other mergers for redundancy
 
 ## Building and Running
 
@@ -49,198 +97,52 @@ distributed-block-builder/
 cargo build --release
 ```
 
-### Run the main binary
-```bash
-cargo run
-```
-
-### Run the network example
+### Run network example
 ```bash
 cargo run --example start_network
 ```
 
 ### Run tests
 ```bash
-# Run all tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run specific test
+# Full protocol test
 cargo test test_full_protocol_flow -- --nocapture
 
-# Using the helper script
-./run.sh test-protocol
+# Specific tests
+cargo test test_conflict_detection
+cargo test test_geographic_routing
+cargo test test_role_assignment
 ```
 
-## Implementation Details
+## Configuration
 
-### Network Transport
-The implementation includes a simulated network transport layer that:
-- Routes messages between nodes
-- Simulates network latency based on geographic regions
-- Handles async message passing via channels
+Key parameters:
+- `MERGERS_FRACTION`: 0.1 (10% of nodes become mergers)
+- `PARTIAL_BLOCK_INTERVAL`: 100ms
+- `MAX_MERGER_CONNECTIONS`: 5 (each simulator connects to max 5 mergers)
 
-### Simulation Engine
-A simplified simulation engine that:
-- Tracks account touches and nonce consumption
-- Calculates gas usage and profit estimates
-- Validates transaction/bundle execution
+## Network Behavior
 
-### Conflict Resolution
-The merging algorithm:
-1. Sorts partial blocks by profit per gas
-2. Iterates through items, checking conflicts
-3. Includes non-conflicting items
-4. Adds latency-sensitive items last
-Note: an actual implementation would have to include latency-sensitive OF in parallel (treating it as a megabundle), or at the top of the block.
+### At 100 nodes:
+- ~10 merging nodes, ~90 simulation nodes
+- Each simulation node sends to ~5 nearby mergers
+- Total messages: O(450) per partial block interval
+- Relay submissions: 10 nodes maximum
 
-### Role Assignment
-Nodes self-organize based on:
-- Relay latencies (lower latency nodes become mergers)
-- Geographic distribution
-- Network capacity
+### At 1000 nodes:
+- ~100 merging nodes, ~900 simulation nodes  
+- Each simulation node sends to ~5 nearby mergers
+- Total messages: O(4500) per partial block interval
+- Relay submissions: 100 nodes (manageable with relay coordination)
 
-## Test Suite
-
-### 1. **End-to-End Protocol Test** (`test_full_protocol_flow`)
-- Starts 10 nodes across 3 regions
-- Generates mixed orderflow for 5 seconds
-- Verifies partial block creation and merging
-
-### 2. **Conflict Detection Test** (`test_conflict_detection`)
-- Tests account conflict detection
-- Tests nonce conflict detection
-- Verifies non-conflicting sets work correctly
-
-### 3. **Geographic Routing Test** (`test_geographic_routing`)
-- Verifies same-region peer preference
-- Tests latency-based routing decisions
-
-## Key Optimizations Demonstrated
-
-1. **Simulation Deduplication**: Each transaction simulated only once
-2. **Parallel Processing**: Multiple nodes build partial blocks simultaneously
-3. **Efficient Merging**: No re-simulation needed during merge
-4. **Geographic Awareness**: Reduces cross-region bandwidth usage
-
-Notes:
-* Importantly, all orderflow will reach a merger in one hop with high probability
-* Users can still submit directly to many nodes to save on some latency without negatively impacting performance of the system
-
-## Scaling Properties
-
-- **Communication**: O(n) via gossip instead of O(n²). This lets us scale to many more nodes (1000+)
-- **Simulation**: O(t) total simulations instead of O(n×t). This lets us scale orderflow proportionally to # of nodes!
-- **Latency**: Maintained through role separation. With high probability orderflow reaches a relay with only a single additional (short) hop.
-- **Reliability**: Natural redundancy through gossip.
-- **Archive data**: O(mergers) instead of O(nodes) writers to redistribution archive. This reduces the cost of 
-    This is achieved through deduplication at the mergers rather than 
-    Note: mergers should send their payloads to other mergers for much improved availability of data!
-    Note: with enough replication we could only ever save a single winning block rather than all blocks built.
-    Note: for the current redistribution, transactions considered have to be managed per partial as well as merged block! But merger nodes can keep track of this data somewhat easily.
-    Note: transactions considered is append-only, and now only kept per-merger.
-    Note: to further reduce performance requirements we can keep diffs of blocks built per merger.
-    With all the above improvements, redistribution archive can possibly be realized without a centralized database.
+### At 10,000 nodes:
+- Would require additional aggregation layer
+- 3-tier architecture: simulation → aggregation → merging
+- Still maintains O(N) communication complexity
 
 ## Future Enhancements
 
-1. **Persistent Storage**: Add database for orderflow history
-2. **Real Network Transport**: Replace simulated transport with actual P2P
-3. **Advanced Heuristics**: Implement sophisticated transaction ordering
-4. **MEV Strategies**: Add MEV extraction algorithms
-5. **Monitoring**: Add Prometheus metrics and dashboards
-
-## Running a Test Scenario
-
-To see the protocol in action with detailed output:
-
-```bash
-cargo test test_full_protocol_flow -- --nocapture
-```
-
-This will:
-1. Start 10 nodes across 3 geographic regions
-2. Generate transactions and bundles for 5 seconds
-3. Show partial block creation and merging
-4. Display final metrics
-
-## Example Output
-
-Running the full protocol test:
-```
-=== Distributed Block Building Protocol Test ===
-
-Started node 0001 in region us-east as Merging
-Started node 0102 in region us-east as Simulation
-Started node 0203 in region us-east as Simulation
-Started node 0304 in region us-east as Simulation
-Started node 0405 in region eu-west as Merging
-Started node 0506 in region eu-west as Simulation
-Started node 0607 in region eu-west as Simulation
-Started node 0708 in region asia-pac as Simulation
-Started node 0809 in region asia-pac as Simulation
-Started node 090a in region asia-pac as Simulation
-
-=== Generating orderflow for 5 seconds ===
-
-Sending transaction a3b2 to node 0102
-Sending bundle 5f3a to node 0203
-Sending transaction 7c4d to node 0506
-Sending latency-sensitive tx to merging node 0001
-Node 0102 sending partial block to merger 0001
-Node 0203 sending partial block to merger 0001
-Merging node 0001 built block 1 with 42 items
-Sending bundle 8e5f to node 0708
-Node 0506 sending partial block to merger 0405
-Merging node 0405 built block 1 with 38 items
-
-=== Test Metrics ===
-Transactions sent: 450
-Bundles sent: 90
-Partial blocks created: 45
-Final blocks built: 5
-Conflicts detected: 12
-Total messages routed: 1823
-
-=== Test completed successfully ===
-```
-
-Running the network example:
-```
-Starting Distributed Block Building Network
-==========================================
-
-Starting 4 nodes in us-east
-Node 3f2a started in us-east
-Node 5c8d started in us-east
-Node 1a9e started in us-east
-Node 7b4f started in us-east
-Starting 3 nodes in eu-west
-Node 9d61 started in eu-west
-Node 2e73 started in eu-west
-Node 6f84 started in eu-west
-Starting 3 nodes in asia-pac
-Node 8a95 started in asia-pac
-Node 4ba6 started in asia-pac
-Node 0cb7 started in asia-pac
-
-All nodes started. Network is initializing...
-
-Generating orderflow...
-TX 1 → Node 5c8d
-TX 2 → Node 1a9e
-Bundle 1 → Node 9d61
-TX 3 → Node 7b4f
-Latency-sensitive TX 4 sent
-TX 5 → Node 2e73
-Running for 30 seconds...
-
-Shutting down network...
-Stopping node 3f2a in us-east
-Stopping node 5c8d in us-east
-...
-
-Network shutdown complete.
-```
+1. **Dynamic Topology Management**: Implement consensus-based role assignment
+2. **Archival Optimization**: Save only winning blocks with diff-based storage
+3. **Multi-Region Coordination**: Optimize cross-region merger communication
+4. **Cancellation Optimization**: Targeted cancellation routing to affected nodes
+5. **Reputation System**: Track which users submit to multiple nodes inappropriately
